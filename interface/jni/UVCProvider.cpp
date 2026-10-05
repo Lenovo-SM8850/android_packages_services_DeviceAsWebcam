@@ -741,11 +741,13 @@ Status UVCProvider::UVCDevice::getFrameAndQueueBufferToGadgetDriver(bool firstBu
 }
 
 void UVCProvider::UVCDevice::processStreamOffEvent() {
+    if (mFrameProvider) {
+        mFrameProvider->stopStreaming();
+    }
     int type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
     if (ioctl(mUVCFd.get(), VIDIOC_STREAMOFF, &type) < 0) {
         ALOGE("%s: uvc gadget driver request to switch stream off failed %s", __FUNCTION__,
               strerror(errno));
-        return;
     }
 
     mFrameProvider.reset();
