@@ -27,6 +27,7 @@ class WebcamControllerImpl(context: Context) : WebcamController() {
 
     private val mCameraController = CameraController(context, /* webcamController= */ this)
     private var mDestroyActivityCallback: Runnable? = null
+    private var mDestroyed = false
 
     override fun setStreamConfig(size: Size, frameRate: Int) {
         synchronized(mLock) {
@@ -47,7 +48,13 @@ class WebcamControllerImpl(context: Context) : WebcamController() {
     }
 
     override fun onDestroy() {
-        synchronized(mLock) { mDestroyActivityCallback?.run() }
+        synchronized(mLock) {
+            if (mDestroyed) return
+            mDestroyed = true
+            mCameraController.destroy()
+            mDestroyActivityCallback?.run()
+            mDestroyActivityCallback = null
+        }
     }
 
     /**
