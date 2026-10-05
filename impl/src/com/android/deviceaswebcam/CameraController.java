@@ -67,6 +67,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -135,6 +137,9 @@ public class CameraController {
     private CameraManager mCameraManager;
     private CameraDevice mCameraDevice;
     private Handler mImageReaderHandler;
+    private HandlerThread mImageReaderThread;
+    private ExecutorService mCameraCallbacksWorker;
+    private ExecutorService mServiceEventsWorker;
     private Executor mCameraCallbacksExecutor;
     private Executor mServiceEventsExecutor;
     private SurfaceTexture mPreviewSurfaceTexture;
@@ -162,6 +167,8 @@ public class CameraController {
     private ConditionVariable mCaptureSessionReady = new ConditionVariable();
     private AtomicBoolean mStartCaptureWebcamStream = new AtomicBoolean(false);
     private final Object mSerializationLock = new Object();
+    private final AtomicBoolean mDestroyed = new AtomicBoolean(false);
+    private final Object mCameraLifecycleLock = new Object();
     // timestamp -> Image
     private ConcurrentHashMap<Long, ImageAndBuffer> mImageMap = new ConcurrentHashMap<>();
     private List<CameraId> mAvailableCameraIds = new ArrayList<>();
@@ -186,15 +193,28 @@ public class CameraController {
     private CameraDevice.StateCallback mCameraStateCallback = new CameraDevice.StateCallback() {
         @Override
         public void onOpened(@NonNull CameraDevice cameraDevice) {
-            if (VERBOSE) {
-                Log.v(TAG, "Camera device opened, creating capture session now");
+            synchronized (mCameraLifecycleLock) {
+                if (mDestroyed.get()) {
+                    cameraDevice.close();
+                    mReadyToStream.open();
+                    return;
+                }
+                if (VERBOSE) {
+                    Log.v(TAG, "Camera device opened, creating capture session now");
+                }
+                mCameraDevice = cameraDevice;
+                mReadyToStream.open();
             }
-            mCameraDevice = cameraDevice;
-            mReadyToStream.open();
         }
 
         @Override
         public void onDisconnected(CameraDevice cameraDevice) {
+            if (mDestroyed.get()) {
+                cameraDevice.close();
+                mReadyToStream.open();
+                return;
+            }
+            cameraDevice.close();
             if (VERBOSE) {
                 Log.v(TAG, "onDisconnected: " + cameraDevice.getId() +
                         " camera available state " +
@@ -206,6 +226,9 @@ public class CameraController {
         private void handleDisconnected() {
             mServiceEventsExecutor.execute(() -> {
                 synchronized (mSerializationLock) {
+                    if (mDestroyed.get()) {
+                        return;
+                    }
                     mCameraDevice = null;
                     stopStreamingAltogetherLocked(/*closeImageReader*/false);
                     if (mStartCaptureWebcamStream.get()) {
@@ -216,6 +239,11 @@ public class CameraController {
         }
         @Override
         public void onError(@NonNull CameraDevice cameraDevice, int error) {
+            if (mDestroyed.get()) {
+                cameraDevice.close();
+                mReadyToStream.open();
+                return;
+            }
             if (VERBOSE) {
                 Log.e(TAG, "Camera id  " + cameraDevice.getId() + ": onError " + error);
             }
@@ -232,23 +260,32 @@ public class CameraController {
             new CameraCaptureSession.StateCallback() {
                 @Override
                 public void onConfigured(@NonNull CameraCaptureSession cameraCaptureSession) {
-                    if (mCameraDevice == null) {
-                        return;
+                    synchronized (mCameraLifecycleLock) {
+                        if (mDestroyed.get() || mCameraDevice == null) {
+                            cameraCaptureSession.close();
+                            mCaptureSessionReady.open();
+                            return;
+                        }
+                        mCaptureSession = cameraCaptureSession;
+                        try {
+                            mCaptureSession.setSingleRepeatingRequest(
+                                    mPreviewRequestBuilder.build(),
+                                    mCameraCallbacksExecutor,
+                                    mCaptureCallback);
+                        } catch (CameraAccessException e) {
+                            Log.e(TAG, "setSingleRepeatingRequest failed", e);
+                        }
+                        mCaptureSessionReady.open();
                     }
-                    mCaptureSession = cameraCaptureSession;
-                    try {
-                        mCaptureSession.setSingleRepeatingRequest(
-                                mPreviewRequestBuilder.build(),
-                                mCameraCallbacksExecutor,
-                                mCaptureCallback);
-                    } catch (CameraAccessException e) {
-                        Log.e(TAG, "setSingleRepeatingRequest failed", e);
-                    }
-                    mCaptureSessionReady.open();
                 }
 
                 @Override
                 public void onConfigureFailed(@NonNull CameraCaptureSession captureSession) {
+                    if (mDestroyed.get()) {
+                        captureSession.close();
+                        mCaptureSessionReady.open();
+                        return;
+                    }
                     Log.e(TAG, "Failed to configure CameraCaptureSession");
                     mCaptureSession = null;
                     mCaptureSessionReady.open();
@@ -259,6 +296,9 @@ public class CameraController {
             new CameraManager.AvailabilityCallback() {
         @Override
         public void onCameraAvailable(String cameraId) {
+            if (mDestroyed.get()) {
+                return;
+            }
             mCameraAvailabilityState.put(cameraId, CameraAvailabilityState.AVAILABLE);
             if (VERBOSE) {
                 Log.v(TAG, "onCameraAvailable: " + cameraId);
@@ -283,6 +323,9 @@ public class CameraController {
 
         @Override
         public void onCameraUnavailable(String cameraId) {
+            if (mDestroyed.get()) {
+                return;
+            }
             // We're unconditionally waiting for available - mStartCaptureWebcamStream will decide
             // whether we need to do anything about it.
             if (VERBOSE) {
@@ -300,7 +343,7 @@ public class CameraController {
                     HardwareBuffer hardwareBuffer;
                     long ts;
                     synchronized (mImgReaderLock) {
-                        if (reader != mImgReader) {
+                        if (mDestroyed.get() || reader != mImgReader) {
                             return;
                         }
                         if (mImageMap.size() >= MAX_BUFFERS) {
@@ -327,8 +370,8 @@ public class CameraController {
                         }
                         ts = image.getTimestamp();
                         hardwareBuffer = image.getHardwareBuffer();
+                        mImageMap.put(ts, new ImageAndBuffer(image, hardwareBuffer));
                     }
-                    mImageMap.put(ts, new ImageAndBuffer(image, hardwareBuffer));
                     // Callback into DeviceAsWebcamFgService to encode image
                     if ((!mStartCaptureWebcamStream.get())
                             || !mWebcamController.queueImageToHost(
@@ -347,6 +390,11 @@ public class CameraController {
     private volatile float mZoomRatio;
     private RotationProvider mRotationProvider;
     private RotationUpdateListener mRotationUpdateListener = null;
+    private final RotationProvider.Listener mRotationListener = rotation -> {
+        if (!mDestroyed.get() && mRotationUpdateListener != null) {
+            mRotationUpdateListener.onRotationUpdated(rotation);
+        }
+    };
     private CameraInfo mCameraInfo = null;
     private UserPrefs mUserPrefs;
     VendorCameraPrefs mRroCameraInfo;
@@ -377,11 +425,7 @@ public class CameraController {
                 mCameraInfo.getSensorOrientation(), mCameraInfo.getLensFacing());
         // Adds a listener to enable the RotationProvider so that we can get the rotation
         // degrees info to rotate the webcam stream images.
-        mRotationProvider.addListener(mCameraCallbacksExecutor, rotation -> {
-            if (mRotationUpdateListener != null) {
-                mRotationUpdateListener.onRotationUpdated(rotation);
-            }
-        });
+        mRotationProvider.addListener(mCameraCallbacksExecutor, mRotationListener);
     }
 
     @Nullable
@@ -684,6 +728,9 @@ public class CameraController {
                             + fps);
         }
         synchronized (mSerializationLock) {
+            if (mDestroyed.get()) {
+                return;
+            }
             boolean disableVideoEncodeFlag =
                     SystemProperties.getBoolean("ro.usb.uvc.disable_video_encode_flag", false);
             long usage = HardwareBuffer.USAGE_CPU_READ_OFTEN;
@@ -707,12 +754,12 @@ public class CameraController {
         }
     }
 
-    private void fillImageWithCameraAccessBlockedLogo(Image img) {
+    private void fillImageWithCameraAccessBlockedLogo(Image img, byte[] bitmapBytes) {
         Image.Plane[] planes = img.getPlanes();
 
         ByteBuffer rgbaBuffer = planes[0].getBuffer();
         // Copy the bitmap array
-        rgbaBuffer.put(mCombinedBitmapBytes);
+        rgbaBuffer.put(bitmapBytes);
     }
 
     private void handleOnCameraAvailable() {
@@ -721,6 +768,9 @@ public class CameraController {
         mServiceEventsExecutor.execute(
                 () -> {
                     synchronized (mSerializationLock) {
+                        if (mDestroyed.get()) {
+                            return;
+                        }
                         if (mCameraDevice != null) {
                             return;
                         }
@@ -739,6 +789,9 @@ public class CameraController {
     private void stopShowingCameraUnavailableLogo() {
         // destroy the executor since camera getting evicted would be a rare occurrence
         synchronized (mSerializationLock) {
+            if (mDestroyed.get()) {
+                return;
+            }
             if (mImageWriterEventsExecutor != null) {
                 mImageWriterEventsExecutor.shutdown();
             }
@@ -760,6 +813,9 @@ public class CameraController {
      */
     private void startShowingCameraUnavailableLogoNoOffload() {
         synchronized (mSerializationLock) {
+            if (mDestroyed.get()) {
+                return;
+            }
             setupBitmaps(mStreamConfigs.mWidth, mStreamConfigs.mHeight);
             long usage = HardwareBuffer.USAGE_CPU_READ_OFTEN;
             synchronized (mImgReaderLock) {
@@ -781,10 +837,27 @@ public class CameraController {
             mImageWriterEventsExecutor = Executors.newScheduledThreadPool(1);
             mImageWriterEventsExecutor.scheduleAtFixedRate(
                     () -> {
-                        Image img = mImageWriter.dequeueInputImage();
-                        // Fill in image
-                        fillImageWithCameraAccessBlockedLogo(img);
-                        mImageWriter.queueInputImage(img);
+                        ImageWriter imageWriter = mImageWriter;
+                        byte[] bitmapBytes = mCombinedBitmapBytes;
+                        if (mDestroyed.get() || imageWriter == null || bitmapBytes == null) {
+                            return;
+                        }
+                        Image img = null;
+                        try {
+                            // Dequeue can block. Do not hold the teardown lock here.
+                            img = imageWriter.dequeueInputImage();
+                            fillImageWithCameraAccessBlockedLogo(img, bitmapBytes);
+                            imageWriter.queueInputImage(img);
+                            img = null;
+                        } catch (IllegalStateException e) {
+                            if (!mDestroyed.get()) {
+                                Log.e(TAG, "Failed to queue camera unavailable image", e);
+                            }
+                        } finally {
+                            if (img != null) {
+                                img.close();
+                            }
+                        }
                     },
                     /* initialDelay= */ 0,
                     /* period= */ 1000 / mStreamConfigs.mFps,
@@ -796,6 +869,9 @@ public class CameraController {
      * Must be called with mSerializationLock held on mServiceExecutor thread.
      */
     private void openCameraBlocking() {
+        if (mDestroyed.get()) {
+            return;
+        }
         if (mCameraManager == null) {
             Log.e(TAG, "CameraManager is not initialized, aborting");
             return;
@@ -845,6 +921,9 @@ public class CameraController {
     }
 
     private CaptureRequest.Builder createInitialPreviewRequestBuilder(Surface targetSurface) {
+        if (mDestroyed.get() || mCameraDevice == null) {
+            return null;
+        }
         CaptureRequest.Builder captureRequestBuilder;
         try {
             captureRequestBuilder =
@@ -984,6 +1063,9 @@ public class CameraController {
         mServiceEventsExecutor.execute(
                 () -> {
                     synchronized (mSerializationLock) {
+                        if (mDestroyed.get()) {
+                            return;
+                        }
                         mPreviewSurfaceTexture = surfaceTexture;
                         mPreviewSize = previewSize;
                         mPreviewSizeChangeListener = previewSizeChangeListener;
@@ -1098,8 +1180,11 @@ public class CameraController {
      * Starts webcam streaming. This should only be called on the service events executor thread.
      */
     public void startWebcamStreamingNoOffload() {
-        mStartCaptureWebcamStream.set(true);
         synchronized (mSerializationLock) {
+            if (mDestroyed.get()) {
+                return;
+            }
+            mStartCaptureWebcamStream.set(true);
             synchronized (mImgReaderLock) {
                 if (mImgReader == null) {
                     Log.e(TAG,
@@ -1157,6 +1242,9 @@ public class CameraController {
             @Override
             public void run() {
                 synchronized (mSerializationLock) {
+                    if (mDestroyed.get()) {
+                        return;
+                    }
                     switch (mCurrentState) {
                         case PREVIEW_AND_WEBCAM_STREAMING:
                             stopPreviewStreamOnlyLocked();
@@ -1211,6 +1299,60 @@ public class CameraController {
         mReadyToStream.close();
     }
 
+    /** Releases camera resources after all previously queued service events. */
+    public void destroy() {
+        synchronized (mCameraLifecycleLock) {
+            if (!mDestroyed.compareAndSet(false, true)) {
+                return;
+            }
+        }
+        mStartCaptureWebcamStream.set(false);
+        // Wake any camera/session open in progress so teardown can reach the executor.
+        mReadyToStream.open();
+        mCaptureSessionReady.open();
+        mCameraManager.unregisterAvailabilityCallback(mCameraAvailabilityCallbacks);
+        mServiceEventsWorker.execute(() -> {
+            synchronized (mSerializationLock) {
+                mStartCaptureWebcamStream.set(false);
+                if (mCaptureSession != null) {
+                    mCaptureSession.close();
+                    mCaptureSession = null;
+                }
+                if (mImageWriterEventsExecutor != null) {
+                    mImageWriterEventsExecutor.shutdown();
+                    mImageWriterEventsExecutor = null;
+                }
+                synchronized (mImgReaderLock) {
+                    for (Long timestamp : mImageMap.keySet()) {
+                        returnImage(timestamp);
+                    }
+                    stopStreamingAltogetherLocked();
+                }
+                // Disconnect the consumer before closing a potentially blocked writer.
+                if (mImageWriter != null) {
+                    mImageWriter.close();
+                    mImageWriter = null;
+                }
+                if (mPreviewSurface != null) {
+                    mPreviewSurface.release();
+                    mPreviewSurface = null;
+                }
+                mPreviewSurfaceTexture = null;
+                mPreviewSize = null;
+                mPreviewSizeChangeListener = null;
+                mPreviewRequestBuilder = null;
+                mOutputConfigurations = null;
+                mStreamConfigs = null;
+                mCombinedBitmapBytes = null;
+                mRotationUpdateListener = null;
+                mRotationProvider.removeListener(mRotationListener);
+            }
+            mImageReaderThread.quitSafely();
+            mCameraCallbacksWorker.shutdown();
+            mServiceEventsWorker.shutdown();
+        });
+    }
+
     public void stopWebcamStreaming() {
         // Started on a background thread since we don't want to be blocking the service's main
         // thread (we call blocking camera open in these methods internally)
@@ -1219,6 +1361,9 @@ public class CameraController {
             public void run() {
                 mStartCaptureWebcamStream.set(false);
                 synchronized (mSerializationLock) {
+                    if (mDestroyed.get()) {
+                        return;
+                    }
                     switch (mCurrentState) {
                         case PREVIEW_AND_WEBCAM_STREAMING:
                             stopWebcamStreamOnlyLocked();
@@ -1242,19 +1387,36 @@ public class CameraController {
     }
 
     private void startBackgroundThread() {
-        HandlerThread imageReaderThread = new HandlerThread("SdkCameraFrameProviderThread");
-        imageReaderThread.start();
-        mImageReaderHandler = new Handler(imageReaderThread.getLooper());
+        mImageReaderThread = new HandlerThread("SdkCameraFrameProviderThread");
+        mImageReaderThread.start();
+        mImageReaderHandler = new Handler(mImageReaderThread.getLooper());
         // We need two executor threads since the surface texture add / remove calls from the fg
         // service are going to be served on the main thread. To not wait on capture session
         // creation, onCaptureSequenceCompleted we need a new thread to cater to preview surface
         // addition / removal.
         // b/277099495 has additional context.
-        mCameraCallbacksExecutor = Executors.newSingleThreadExecutor();
-        mServiceEventsExecutor = Executors.newSingleThreadExecutor();
+        mCameraCallbacksWorker = Executors.newSingleThreadExecutor();
+        mServiceEventsWorker = Executors.newSingleThreadExecutor();
+        mServiceEventsExecutor = command -> {
+            synchronized (mCameraLifecycleLock) {
+                if (!mDestroyed.get()) mServiceEventsWorker.execute(command);
+            }
+        };
+        mCameraCallbacksExecutor = command -> {
+            try {
+                mCameraCallbacksWorker.execute(command);
+            } catch (RejectedExecutionException e) {
+                if (!mDestroyed.get()) throw e;
+                // Late camera callbacks still close their camera/session after teardown.
+                command.run();
+            }
+        };
     }
 
     private void createCaptureSessionBlocking() {
+        if (mDestroyed.get()) {
+            return;
+        }
         if (mCameraId.physicalCameraId != null) {
             for (OutputConfiguration config : mOutputConfigurations) {
                 config.setPhysicalCameraId(mCameraId.physicalCameraId);
@@ -1279,15 +1441,16 @@ public class CameraController {
     }
 
     public void returnImage(long timestamp) {
-        ImageAndBuffer imageAndBuffer = mImageMap.get(timestamp);
+        ImageAndBuffer imageAndBuffer = mImageMap.remove(timestamp);
         if (imageAndBuffer == null) {
-            Log.e(TAG, "Image with timestamp " + timestamp +
-                    " was never encoded / already returned");
+            if (!mDestroyed.get()) {
+                Log.e(TAG, "Image with timestamp " + timestamp +
+                        " was never encoded / already returned");
+            }
             return;
         }
         imageAndBuffer.buffer.close();
         imageAndBuffer.image.close();
-        mImageMap.remove(timestamp);
         if (VERBOSE) {
             Log.v(TAG, "Returned image " + timestamp);
         }
@@ -1307,6 +1470,9 @@ public class CameraController {
         mZoomRatio = zoomRatio;
         mServiceEventsExecutor.execute(() -> {
             synchronized (mSerializationLock) {
+                if (mDestroyed.get()) {
+                    return;
+                }
                 if (mCameraDevice == null || mCaptureSession == null) {
                     return;
                 }
@@ -1347,6 +1513,9 @@ public class CameraController {
      */
     public void toggleCamera() {
         synchronized (mSerializationLock) {
+            if (mDestroyed.get()) {
+                return;
+            }
             CameraId newCameraId;
 
             if (Objects.equals(mCameraId, mBackCameraId)) {
@@ -1364,6 +1533,9 @@ public class CameraController {
      */
     public void switchCamera(CameraId cameraId) {
         synchronized (mSerializationLock) {
+            if (mDestroyed.get()) {
+                return;
+            }
             mCameraId = cameraId;
             mUserPrefs.storeCameraId(cameraId.toString());
             mCameraInfo = getOrCreateCameraInfo(mCameraId);
@@ -1382,6 +1554,9 @@ public class CameraController {
         mServiceEventsExecutor.execute(
                 () -> {
                     synchronized (mSerializationLock) {
+                        if (mDestroyed.get()) {
+                            return;
+                        }
                         if (mCameraDevice == null) {
                             // Its possible the preview screen is up before the camera device is
                             // opened.
@@ -1508,6 +1683,9 @@ public class CameraController {
     public void tapToFocus(float[] normalizedPoint) {
         mServiceEventsExecutor.execute(() -> {
             synchronized (mSerializationLock) {
+                if (mDestroyed.get()) {
+                    return;
+                }
                 if (mCameraDevice == null || mCaptureSession == null) {
                     return;
                 }
@@ -1565,6 +1743,9 @@ public class CameraController {
      */
     public void setHighQualityModeEnabled(boolean enabled, Runnable callback) {
         synchronized (mSerializationLock) {
+            if (mDestroyed.get()) {
+                return;
+            }
             if (enabled == mHighQualityModeEnabled) {
                 callback.run();
                 return;
@@ -1575,6 +1756,9 @@ public class CameraController {
         }
         mServiceEventsExecutor.execute(() -> {
             synchronized (mSerializationLock) {
+                if (mDestroyed.get()) {
+                    return;
+                }
                 int currentCameraFacing = getCameraInfo().getLensFacing();
                 mRroCameraInfo = createVendorCameraPrefs(mHighQualityModeEnabled);
                 refreshAvailableCameraIdList();
@@ -1599,6 +1783,9 @@ public class CameraController {
     public void resetToAutoFocus() {
         mServiceEventsExecutor.execute(() -> {
             synchronized (mSerializationLock) {
+                if (mDestroyed.get()) {
+                    return;
+                }
                 if (mCameraDevice == null || mCaptureSession == null) {
                     return;
                 }
